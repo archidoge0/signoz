@@ -1,0 +1,94 @@
+name: GHAV SigNoz 12369 preference sqlite
+on:
+  push:
+    branches:
+      - codex/ghav-signoz12369-ours
+permissions:
+  contents: read
+jobs:
+  seed:
+    if: github.event.head_commit.message == 'ghav-seed'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    steps:
+      - name: Checkout fixed historical source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: fd2bd85e90f2c5d6aff2f8c6f0b182a500a68e12
+          persist-credentials: false
+      - name: Verify source for cache preparation
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "fd2bd85e90f2c5d6aff2f8c6f0b182a500a68e12"
+          test "$(git rev-parse HEAD^{tree})" = "e53161348a54b216eb4b6ebba81a091c5557c768"
+      - name: Build same integration Dockerfile to seed Go mounts
+        shell: bash
+        run: |
+          set -euo pipefail
+          DOCKER_BUILDKIT=1 docker build -f cmd/enterprise/Dockerfile.integration --build-arg TARGETARCH=amd64 --build-arg ZEUSURL=http://zeus:8080 .
+      - name: Export BuildKit cache mounts as tar files
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/cacheci" "$RUNNER_TEMP/extract-context"
+          cat > "$RUNNER_TEMP/extract.Dockerfile" <<'EOF'
+          FROM busybox:1.37
+          RUN --mount=type=cache,target=/root/.cache/go-build \
+              --mount=type=cache,target=/go/pkg/mod \
+              --mount=type=cache,target=/pnpm/store \
+              mkdir -p /out && \
+              tar -cf /out/go-build.tar -C /root/.cache/go-build . && \
+              tar -cf /out/go-mod.tar -C /go/pkg/mod . && \
+              tar -cf /out/pnpm-store.tar -C /pnpm/store .
+          EOF
+          docker build -f "$RUNNER_TEMP/extract.Dockerfile" -t ghav-signoz12369-extract "$RUNNER_TEMP/extract-context"
+          id=$(docker create ghav-signoz12369-extract)
+          docker cp "$id":/out/. "$RUNNER_TEMP/cacheci/"
+          docker rm "$id"
+          sha256sum "$RUNNER_TEMP/cacheci/"*.tar
+      - name: Save isolated cache key
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: ${{ runner.temp }}/cacheci
+          key: ghav-signoz12369-tests-primary-v1
+  preference-sqlite:
+    if: github.event.head_commit.message != 'ghav-seed'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout fixed historical source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: fd2bd85e90f2c5d6aff2f8c6f0b182a500a68e12
+          persist-credentials: false
+      - name: Verify fixed source and test input
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "fd2bd85e90f2c5d6aff2f8c6f0b182a500a68e12"
+          test "$(git rev-parse HEAD^{tree})" = "e53161348a54b216eb4b6ebba81a091c5557c768"
+          echo "GHAV_SOURCE_SHA=$(git rev-parse HEAD)"
+          sha256sum tests/uv.lock cmd/enterprise/Dockerfile.integration tests/integration/tests/preference/*.py
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: '3.13'
+      - name: Set up uv
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7
+        with:
+          version: '0.12.21'
+          enable-cache: false
+      - name: Install historical Python dependencies
+        shell: bash
+        run: cd tests && uv sync --frozen
+      - name: Run complete preference sqlite integration suite
+        shell: bash
+        run: |
+          cd tests
+          uv run pytest --basetemp=./tmp/ integration/tests/preference --sqlstore-provider sqlite --sqlite-mode wal --postgres-version 15 --clickhouse-version 25.12.5 --schema-migrator-version v0.144.6
+      - name: Report built integration image
+        if: always()
+        shell: bash
+        run: |
+          docker image inspect signoz:integration --format 'GHAV_IMAGE_ID={{.Id}}' || true
