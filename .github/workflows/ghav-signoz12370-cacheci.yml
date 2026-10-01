@@ -1,0 +1,170 @@
+name: GHAV SigNoz 12370 cacheci human
+
+on:
+  push:
+    branches:
+      - codex/ghav-signoz12370-human
+
+permissions:
+  contents: read
+  actions: write
+
+# Cancelling mid-rotation is safe: the sequential delete-then-save order
+# leaves at most one key missing at any moment.
+concurrency:
+  group: ghav-signoz12370-human
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    env:
+      GHAV_TAR_FORMAT: 'true'
+    timeout-minutes: 35
+    runs-on: ubuntu-24.04
+    steps:
+      - name: checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: c110e14505ae5850de550fba04c6c0d4a20fac28
+          persist-credentials: false
+      - name: Verify fixed source and Dockerfile inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = 'c110e14505ae5850de550fba04c6c0d4a20fac28'
+          test "$(git rev-parse HEAD^{tree})" = 'ba1bcac1e2c56f5db6f0f1bff33683e48c60ea07'
+          echo "GHAV_SOURCE_SHA=$(git rev-parse HEAD)"
+          echo "GHAV_SOURCE_TREE=$(git rev-parse HEAD^{tree})"
+          sha256sum cmd/enterprise/Dockerfile.integration cmd/enterprise/Dockerfile.with-web.integration go.mod go.sum frontend/pnpm-lock.yaml
+      - name: restore
+        id: restore
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: ${{ runner.temp }}/cacheci
+          key: ghav-signoz12370-human-primary-v1
+          restore-keys: |
+            ghav-signoz12370-human-secondary-v1
+      - name: inject
+        if: steps.restore.outputs.cache-matched-key != ''
+        run: |
+          cat > "$RUNNER_TEMP/inject.Dockerfile" <<'EOF'
+          FROM busybox:1.37
+          RUN --mount=type=cache,target=/root/.cache/go-build \
+              --mount=type=cache,target=/go/pkg/mod \
+              --mount=type=cache,target=/pnpm/store \
+              --mount=type=bind,target=/restored \
+              tar -xf /restored/go-build.tar -C /root/.cache/go-build && \
+              tar -xf /restored/go-mod.tar -C /go/pkg/mod && \
+              tar -xf /restored/pnpm-store.tar -C /pnpm/store
+          EOF
+          docker build -f "$RUNNER_TEMP/inject.Dockerfile" "$RUNNER_TEMP/cacheci"
+      - name: build
+        run: |
+          docker build -f cmd/enterprise/Dockerfile.integration --build-arg TARGETARCH=amd64 --build-arg ZEUSURL=http://zeus:8080 .
+          docker build -f cmd/enterprise/Dockerfile.with-web.integration --build-arg TARGETARCH=amd64 --build-arg ZEUSURL=http://zeus:8080 .
+      # docker cp instead of --output type=local (the local exporter stalls on
+      # multi-GB outputs); tarballs instead of raw trees so the host never hits
+      # the permission and symlink semantics that broke docker cp.
+      - name: extract
+        run: |
+          rm -rf "$RUNNER_TEMP/cacheci"
+          mkdir -p "$RUNNER_TEMP/cacheci" "$RUNNER_TEMP/extract-context"
+          cat > "$RUNNER_TEMP/extract.Dockerfile" <<'EOF'
+          FROM busybox:1.37
+          RUN --mount=type=cache,target=/root/.cache/go-build \
+              --mount=type=cache,target=/go/pkg/mod \
+              --mount=type=cache,target=/pnpm/store \
+              mkdir -p /out && \
+              tar -cf /out/go-build.tar -C /root/.cache/go-build . && \
+              tar -cf /out/go-mod.tar -C /go/pkg/mod . && \
+              tar -cf /out/pnpm-store.tar -C /pnpm/store .
+          EOF
+          timeout 900s docker build -f "$RUNNER_TEMP/extract.Dockerfile" -t cacheci-extract "$RUNNER_TEMP/extract-context"
+          id=$(docker create cacheci-extract)
+          timeout 900s docker cp "$id":/out/. "$RUNNER_TEMP/cacheci/"
+          docker rm "$id"
+      - name: Probe extracted cache payload
+        shell: bash
+        run: |
+          set -euo pipefail
+          du -sh "$RUNNER_TEMP/cacheci"/*
+          find "$RUNNER_TEMP/cacheci" -type f | wc -l
+          if [ "${GHAV_TAR_FORMAT}" = true ]; then
+            test -s "$RUNNER_TEMP/cacheci/go-build.tar"
+            test -s "$RUNNER_TEMP/cacheci/go-mod.tar"
+            test -s "$RUNNER_TEMP/cacheci/pnpm-store.tar"
+            sha256sum "$RUNNER_TEMP/cacheci/"*.tar
+          else
+            test -d "$RUNNER_TEMP/cacheci/go-build"
+            test -d "$RUNNER_TEMP/cacheci/go-mod"
+            test -d "$RUNNER_TEMP/cacheci/pnpm-store"
+          fi
+      # Fixed cache keys are immutable, so each key must be deleted before it
+      # can be saved again. Rotating primary and secondary one after the other
+      # keeps at least one key restorable for concurrent test runs.
+      - name: delete-primary
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh cache delete ghav-signoz12370-human-primary-v1 --repo "$GITHUB_REPOSITORY" || true
+      - name: save-primary
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: ${{ runner.temp }}/cacheci
+          key: ghav-signoz12370-human-primary-v1
+      - name: delete-secondary
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh cache delete ghav-signoz12370-human-secondary-v1 --repo "$GITHUB_REPOSITORY" || true
+      - name: save-secondary
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: ${{ runner.temp }}/cacheci
+          key: ghav-signoz12370-human-secondary-v1
+  consumer:
+    name: Verify cache in a fresh integration build
+    needs: tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Checkout same fixed source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: c110e14505ae5850de550fba04c6c0d4a20fac28
+          persist-credentials: false
+      - name: Verify fixed source
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = 'c110e14505ae5850de550fba04c6c0d4a20fac28'
+          test "$(git rev-parse HEAD^{tree})" = 'ba1bcac1e2c56f5db6f0f1bff33683e48c60ea07'
+          echo "GHAV_SOURCE_SHA=$(git rev-parse HEAD)"
+          echo "GHAV_SOURCE_TREE=$(git rev-parse HEAD^{tree})"
+      - name: Restore published primary cache
+        id: restore
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: ${{ runner.temp }}/cacheci
+          key: ghav-signoz12370-human-primary-v1
+      - name: Assert cache hit and inject into fresh BuildKit
+        shell: bash
+        run: |
+          set -euo pipefail
+          test '${{ steps.restore.outputs.cache-hit }}' = true
+          echo 'GHAV_CONSUMER_CACHE_HIT=true'
+          du -sh "$RUNNER_TEMP/cacheci"/*
+          cat > "$RUNNER_TEMP/inject.Dockerfile" <<'EOF'
+          FROM busybox:1.37
+          RUN --mount=type=cache,target=/root/.cache/go-build \
+              --mount=type=cache,target=/go/pkg/mod \
+              --mount=type=cache,target=/pnpm/store \
+              --mount=type=bind,target=/restored \
+              tar -xf /restored/go-build.tar -C /root/.cache/go-build && \
+              tar -xf /restored/go-mod.tar -C /go/pkg/mod && \
+              tar -xf /restored/pnpm-store.tar -C /pnpm/store
+          EOF
+          DOCKER_BUILDKIT=1 docker build -f "$RUNNER_TEMP/inject.Dockerfile" "$RUNNER_TEMP/cacheci"
+      - name: Build integration image from restored cache
+        shell: bash
+        run: |
+          set -euo pipefail
+          DOCKER_BUILDKIT=1 docker build -f cmd/enterprise/Dockerfile.integration --build-arg TARGETARCH=amd64 --build-arg ZEUSURL=http://zeus:8080 .
