@@ -3,6 +3,7 @@ package tracestelemetryschema
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 
 	schema "github.com/SigNoz/signoz-otel-collector/cmd/signozschemamigrator/schema_migrator"
@@ -506,14 +507,15 @@ func negatePresence(presence string) string {
 // legacy Map's absent-key semantics. Negative operators carry no guard, so NULL <> x would drop rows
 // lacking the key, whereas the Map defaulted them to the type zero and kept them (0 <> x).
 // String needs no fold: its ::String value already reads absent as the empty string.
-func foldAbsentJSONReadToTypeDefault(key *telemetrytypes.TelemetryFieldKey, operator qbtypes.FilterOperator, expr string) string {
+func (m *storage) foldAbsentJSONReadToTypeDefault(ctx context.Context, q qbtypes.QueryInfo, key *telemetrytypes.TelemetryFieldKey, operator qbtypes.FilterOperator, expr string) string {
 	if !operator.IsNegativeOperator() || operator == qbtypes.FilterOperatorNotExists {
 		return expr
 	}
 	if key.FieldContext != telemetrytypes.FieldContextAttribute {
 		return expr
 	}
-	if !attributeColumnEvolutionRegistered(key, SpanAttributesColumn) {
+	columns, err := m.getColumn(ctx, q, key)
+	if err != nil || !slices.ContainsFunc(columns, func(column *schema.Column) bool { return column.Name == SpanAttributesColumn }) {
 		return expr
 	}
 	switch key.FieldDataType {
@@ -607,6 +609,6 @@ func (m *storage) Compile(ctx context.Context, q qbtypes.QueryInfo, logical *tel
 	// collision cast: the read is then non-nullable (like a Map column), so a downstream string
 	// cast (numeric member vs a string value) can't pair a Nullable(String) with the numeric
 	// default and raise a type mismatch.
-	read.SQL = foldAbsentJSONReadToTypeDefault(logical.Single(), operator, read.SQL)
+	read.SQL = m.foldAbsentJSONReadToTypeDefault(ctx, q, logical.Single(), operator, read.SQL)
 	return querybuilder.SharedConditionForRead(ctx, q, m, logical, read, operator, value, sb)
 }

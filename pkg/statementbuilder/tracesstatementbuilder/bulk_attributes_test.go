@@ -23,9 +23,9 @@ import (
 // jsonAttrColRe matches the bare `attributes` JSON column in the SELECT list, not the legacy maps.
 var jsonAttrColRe = regexp.MustCompile(`,\s*attributes\s*(,| FROM )`)
 
-func newBulkTestBuilder(t *testing.T, releaseTime time.Time) *traceQueryStatementBuilder {
+func newBulkTestBuilder(t *testing.T, releaseTime time.Time, traceAttrsJSONOn bool, attributeEvolution bool) *traceQueryStatementBuilder {
 	t.Helper()
-	fl := flaggertest.WithBooleanFlags(t, map[string]bool{flagger.FeatureUseTraceAttributesJSON.String(): true})
+	fl := flaggertest.WithBooleanFlags(t, map[string]bool{flagger.FeatureUseTraceAttributesJSON.String(): traceAttrsJSONOn})
 	storage := tracestelemetryschema.NewStorage()
 	store := telemetrytypestest.NewMockMetadataStore()
 	store.KeysMap = tracestelemetryschema.BuildCompleteFieldKeyMap(releaseTime)
@@ -35,7 +35,15 @@ func newBulkTestBuilder(t *testing.T, releaseTime time.Time) *traceQueryStatemen
 		FieldDataType: telemetrytypes.FieldDataTypeString,
 		Signal:        telemetrytypes.SignalTraces,
 	}}
-	store.ColumnEvolutionMetadataMap["traces:attribute:__all__"] = tracestelemetryschema.MockAttributeEvolutionData(releaseTime)
+	store.KeysMap["http.response.status_code"] = []*telemetrytypes.TelemetryFieldKey{{
+		Name:          "http.response.status_code",
+		FieldContext:  telemetrytypes.FieldContextAttribute,
+		FieldDataType: telemetrytypes.FieldDataTypeNumber,
+		Signal:        telemetrytypes.SignalTraces,
+	}}
+	if attributeEvolution {
+		store.ColumnEvolutionMetadataMap["traces:attribute:__all__"] = tracestelemetryschema.MockAttributeEvolutionData(releaseTime)
+	}
 
 	aggExprRewriter := querybuilder.NewAggExprRewriter(instrumentationtest.New().ToProviderSettings(), nil, storage, fl, telemetrytypes.SignalTraces)
 	return NewTraceQueryStatementBuilder(
@@ -50,7 +58,7 @@ func TestListQuerySelectsAllAttributeHomes(t *testing.T) {
 	rel := releaseTime.UnixMilli()
 	day := int64(24 * time.Hour / time.Millisecond)
 
-	b := newBulkTestBuilder(t, releaseTime)
+	b := newBulkTestBuilder(t, releaseTime, true, true)
 
 	testCases := []struct {
 		name    string
@@ -88,7 +96,7 @@ func TestGroupByAttributeHomeAcrossRollout(t *testing.T) {
 	rel := releaseTime.UnixMilli()
 	day := int64(24 * time.Hour / time.Millisecond)
 
-	b := newBulkTestBuilder(t, releaseTime)
+	b := newBulkTestBuilder(t, releaseTime, true, true)
 
 	testCases := []struct {
 		name            string
@@ -145,6 +153,52 @@ func TestGroupByAttributeHomeAcrossRollout(t *testing.T) {
 			for _, unwanted := range testCase.wantNotContains {
 				assert.NotContains(t, stmt.Query, unwanted)
 			}
+		})
+	}
+}
+
+// TestAttributeJSONFlagOffQueryMatchesMapOnly: with use_trace_attributes_json off, a registered
+// `attributes` evolution leaves the whole statement identical to one without it, in every window.
+func TestAttributeJSONFlagOffQueryMatchesMapOnly(t *testing.T) {
+	releaseTime := time.Date(2025, 5, 22, 22, 0, 0, 0, time.UTC)
+	rel := releaseTime.UnixMilli()
+	day := int64(24 * time.Hour / time.Millisecond)
+
+	withEvolution := newBulkTestBuilder(t, releaseTime, false, true)
+	withoutEvolution := newBulkTestBuilder(t, releaseTime, false, false)
+
+	query := qbtypes.QueryBuilderQuery[qbtypes.TraceAggregation]{
+		Signal:       telemetrytypes.SignalTraces,
+		StepInterval: qbtypes.Step{Duration: 30 * time.Second},
+		Aggregations: []qbtypes.TraceAggregation{{Expression: "avg(http.response.status_code)"}},
+		Filter:       &qbtypes.Filter{Expression: "http.route EXISTS AND http.response.status_code != 200 AND http.route != '/health'"},
+		GroupBy: []qbtypes.GroupByKey{{TelemetryFieldKey: telemetrytypes.TelemetryFieldKey{
+			Name:          "http.route",
+			FieldContext:  telemetrytypes.FieldContextAttribute,
+			FieldDataType: telemetrytypes.FieldDataTypeString,
+		}}},
+		Limit: 10,
+	}
+
+	testCases := []struct {
+		name    string
+		startMs uint64
+		endMs   uint64
+	}{
+		{"BeforeRollout", uint64(rel - 2*day), uint64(rel - day)},
+		{"AfterRollout", uint64(rel + day), uint64(rel + 2*day)},
+		{"StraddlingRollout", uint64(rel - day), uint64(rel + day)},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			got, err := withEvolution.Build(context.Background(), valuer.UUID{}, testCase.startMs, testCase.endMs, qbtypes.RequestTypeTimeSeries, query, nil)
+			require.NoError(t, err)
+			want, err := withoutEvolution.Build(context.Background(), valuer.UUID{}, testCase.startMs, testCase.endMs, qbtypes.RequestTypeTimeSeries, query, nil)
+			require.NoError(t, err)
+			assert.Equal(t, want.Query, got.Query)
+			assert.Equal(t, want.Args, got.Args)
+			assert.NotContains(t, got.Query, "attributes.`")
 		})
 	}
 }
