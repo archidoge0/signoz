@@ -25,6 +25,7 @@ import {
 } from 'hooks/useHandleExplorerTabChange';
 import { useIsAIAssistantEnabled } from 'hooks/useIsAIAssistantEnabled';
 import { useSafeNavigate } from 'hooks/useSafeNavigate';
+import { useSavedViewEnabled } from 'hooks/useSavedViewEnabled';
 import { isEmpty } from 'lodash-es';
 import ErrorBoundaryFallback from 'pages/ErrorBoundaryFallback/ErrorBoundaryFallback';
 import {
@@ -64,6 +65,7 @@ function Explorer(): JSX.Element {
 		redirectWithQueryBuilderData,
 	} = useQueryBuilder();
 	const { safeNavigate } = useSafeNavigate();
+	const isSavedViewEnabled = useSavedViewEnabled();
 	const getExportToDashboardLink = useGetExportToDashboardLink();
 	const { handleExplorerTabChange } = useHandleExplorerTabChange();
 	const isAIAssistantEnabled = useIsAIAssistantEnabled();
@@ -405,15 +407,17 @@ function Explorer(): JSX.Element {
 					</div>
 				</div>
 			</QuickFiltersLayout>
-			<ExplorerOptionWrapper
-				disabled={!stagedQuery}
-				query={exportDefaultQuery}
-				sourcepage={DataSource.METRICS}
-				onExport={handleExport}
-				isOneChartPerQuery={showOneChartPerQuery}
-				splitedQueries={splitedQueries}
-				handleChangeSelectedView={handleChangeSelectedView}
-			/>
+			{!isSavedViewEnabled && (
+				<ExplorerOptionWrapper
+					disabled={!stagedQuery}
+					query={exportDefaultQuery}
+					sourcepage={DataSource.METRICS}
+					onExport={handleExport}
+					isOneChartPerQuery={showOneChartPerQuery}
+					splitedQueries={splitedQueries}
+					handleChangeSelectedView={handleChangeSelectedView}
+				/>
+			)}
 			{isMetricDetailsOpen && selectedMetricName && (
 				<MetricDetails
 					metricName={selectedMetricName}
